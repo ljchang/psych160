@@ -155,17 +155,41 @@ You almost always want **both**: inheritance so new content gets the right perms
 
 `nfs4_setfacl -R` will fail with `Permission denied` on any file inside the tree that you don't own — even if the top-level directory is yours. This happens in shared lab directories where different users have created files over time.
 
+**CRITICAL GOTCHA:** `nfs4_setfacl -R` **aborts on the first permission error** — it does not skip and continue. This means one file owned by a labmate deep in the tree can cause the recursive walk to stop early, leaving most of the tree unchanged. The command will print:
+```
+Failed setxattr operation: Permission denied
+An error occurred during recursive file tree walk.
+```
+and exit with status 255. Any directories it hadn't reached yet are untouched. **Always verify after a recursive apply** by spot-checking a few deep subdirectories with `nfs4_getfacl`.
+
 **Three ways to handle existing files:**
 
-1. **Do nothing.** Only new files will have the right ACL. Old files keep whatever they had. Fine if the lab reorganizes or the new member only works with new data.
+1. **Do nothing.** Only new files will have the right ACL (thanks to the `fd` inheritance ACE). Old files keep whatever they had. Fine if the lab reorganizes or the new member only works with new data.
 
-2. **Ask file owners to re-apply permissions themselves.** Each owner can run:
+2. **Use a walker that continues past errors.** This is the right move if you want to fix up as much of the existing tree as you can. Two options:
+
+   **(a) `find -exec` one-at-a-time** — errors from `nfs4_setfacl` don't abort `find`:
    ```bash
-   find /dartfs-hpc/rc/home/v/f00275v/cosanlab -user $(whoami) \
-     -exec nfs4_setfacl -a "A::f006jkw@KIEWIT.DARTMOUTH.EDU:rwaDxtTnNcy" {} \;
-   ```
+   ROOT=/dartfs-hpc/rc/home/v/f00275v/cosanlab
+   USER=f006jkw
 
-3. **Escalate to Research Computing.** Email `research.computing@dartmouth.edu` — they can run the recursive change as root across all owners.
+   # Directories: direct + inheritance
+   find "$ROOT" -type d -user "$(whoami)" -exec sh -c '
+     nfs4_setfacl -a "A::'"$USER"'@KIEWIT.DARTMOUTH.EDU:rwaDxtTnNcy" "$1" 2>/dev/null
+     nfs4_setfacl -a "A:fd:'"$USER"'@KIEWIT.DARTMOUTH.EDU:rwaDxtTnNcy" "$1" 2>/dev/null
+   ' _ {} \;
+
+   # Files: direct ACE only
+   find "$ROOT" -type f -user "$(whoami)" \
+     -exec nfs4_setfacl -a "A::${USER}@KIEWIT.DARTMOUTH.EDU:rwaDxtTnNcy" {} \;
+   ```
+   Restricting to `-user $(whoami)` skips files you can't modify anyway — faster and no spurious errors.
+
+   **Watch out for duplicates:** `nfs4_setfacl -a` does **not** dedupe. Running it twice on the same file produces two identical ACEs. If you might re-run, either gate on `nfs4_getfacl | grep -q "$USER"` first, or clean up afterward with `nfs4_setfacl -e` / `-s`.
+
+   **(b) Python walker that checks before adding** — safer for re-runs, gives you a progress report. See the script in the appendix below.
+
+3. **Escalate to Research Computing.** Email `research.computing@dartmouth.edu` — they can run the recursive change as root across all owners. Right choice when labmates aren't available to fix their own files.
 
 ---
 
@@ -216,3 +240,75 @@ A::EVERYONE@:rxtncy
 - `man nfs4_setfacl` — full flag documentation
 - Dartmouth RC docs: <https://rc.dartmouth.edu/index.php/dartfs/>
 - RC support: `research.computing@dartmouth.edu`
+
+---
+
+## Appendix: Python walker for large shared trees
+
+Safer than `find -exec` because it checks the current ACL before adding — so it never creates duplicate ACEs and is idempotent. Prints progress every 200 items. Save as `apply_acl.py`, edit the three constants at the top, run with `python3 -u apply_acl.py`.
+
+```python
+#!/usr/bin/env python3
+import os, subprocess, sys, time
+
+ROOT      = "/dartfs-hpc/rc/home/v/f00275v/cosanlab"
+PRINCIPAL = "f006jkw@KIEWIT.DARTMOUTH.EDU"
+PERMS     = "rwaDxtTnNcy"
+
+DIRECT_ACE  = f"A::{PRINCIPAL}:{PERMS}"
+INHERIT_ACE = f"A:fd:{PRINCIPAL}:{PERMS}"
+MY_UID      = os.getuid()
+PROGRESS_EVERY = 200
+
+stats = {k: 0 for k in (
+    "dirs_scanned","dirs_fixed","dirs_already_ok","dirs_not_owned","dirs_failed",
+    "files_scanned","files_fixed","files_already_ok","files_not_owned","files_failed",
+)}
+start = time.time()
+
+def log(msg):
+    print(f"[{time.time()-start:6.1f}s] {msg}", flush=True)
+
+def get_acl(p):
+    r = subprocess.run(["nfs4_getfacl", p], capture_output=True, text=True, timeout=30)
+    return r.stdout if r.returncode == 0 else None
+
+def add_ace(p, ace):
+    r = subprocess.run(["nfs4_setfacl", "-a", ace, p], capture_output=True, text=True, timeout=30)
+    return r.returncode == 0
+
+def process(path, is_dir):
+    key = "dirs" if is_dir else "files"
+    stats[f"{key}_scanned"] += 1
+    total = stats["dirs_scanned"] + stats["files_scanned"]
+    if total % PROGRESS_EVERY == 0:
+        log(f"scanned={total} fixed_dirs={stats['dirs_fixed']} fixed_files={stats['files_fixed']} at={path[:120]}")
+    try:
+        st = os.lstat(path)
+    except OSError:
+        stats[f"{key}_failed"] += 1; return
+    if st.st_uid != MY_UID:
+        stats[f"{key}_not_owned"] += 1; return
+    acl = get_acl(path)
+    if acl is None:
+        stats[f"{key}_failed"] += 1; return
+    need_direct  = DIRECT_ACE not in acl
+    need_inherit = is_dir and INHERIT_ACE not in acl
+    if not need_direct and not need_inherit:
+        stats[f"{key}_already_ok"] += 1; return
+    ok = True
+    if need_direct:  ok = add_ace(path, DIRECT_ACE) and ok
+    if need_inherit: ok = add_ace(path, INHERIT_ACE) and ok
+    stats[f"{key}_fixed" if ok else f"{key}_failed"] += 1
+
+for dirpath, dirnames, filenames in os.walk(ROOT, followlinks=False):
+    process(dirpath, is_dir=True)
+    for fn in filenames:
+        process(os.path.join(dirpath, fn), is_dir=False)
+
+log("=== DONE ===")
+for k, v in stats.items():
+    log(f"  {k}: {v}")
+```
+
+Expect ~20-40 items/sec on DartFS — a tree with 100k files takes roughly an hour. Run in a tmux/screen session or with `nohup`.
